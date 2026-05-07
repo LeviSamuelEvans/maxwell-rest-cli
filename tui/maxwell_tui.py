@@ -293,6 +293,16 @@ class MaxwellClient:
             text = result.output
         return f"{command} {jid}", text.splitlines()
 
+    def detail_summary(self, command: str, jid: str) -> tuple[str, list[str]]:
+        result = self.run(command, jid, "--json")
+        if not result.ok:
+            return command, [result.error]
+        try:
+            payload = json.loads(result.output)
+        except json.JSONDecodeError as exc:
+            return command, [f"invalid {command} JSON: {exc}"]
+        return f"{command} {jid}", summary_lines(payload, command)
+
     def cancel(self, jid: str) -> str:
         result = self.run("cancel", jid)
         if result.ok:
@@ -363,6 +373,46 @@ class SelfTestClient:
 
     def json_command(self, command: str, jid: str) -> tuple[str, list[str]]:
         return f"{command} {jid}", [f"{command}:{jid}"]
+
+    def detail_summary(self, command: str, jid: str) -> tuple[str, list[str]]:
+        payload = {
+            "jobs": [
+                {
+                    "job_id": int(jid),
+                    "name": "one",
+                    "job_state": ["RUNNING"],
+                    "state_reason": "None",
+                    "partition": "allcpu",
+                    "nodes": "max-wn001",
+                    "submit_time": {"set": True, "number": 1778116305},
+                    "start_time": {"set": True, "number": 1778116312},
+                    "tres_req_str": "cpu=1,mem=1000M,node=1,billing=1",
+                    "tres_alloc_str": "cpu=40,node=1,billing=40",
+                    "stdout_expanded": "/home/alice/slurm-1.out",
+                    "exit_code": {"status": ["SUCCESS"]},
+                }
+            ]
+        }
+        if command == "history":
+            payload["jobs"][0]["state"] = {"current": ["COMPLETED"], "reason": "None"}
+            payload["jobs"][0]["time"] = {
+                "submission": 1778116305,
+                "start": 1778116312,
+                "end": 1778116342,
+                "elapsed": 30,
+            }
+            payload["jobs"][0]["tres"] = {
+                "requested": [
+                    {"type": "cpu", "count": 1},
+                    {"type": "mem", "count": 1000},
+                    {"type": "billing", "count": 1},
+                ],
+                "allocated": [
+                    {"type": "cpu", "count": 40},
+                    {"type": "billing", "count": 40},
+                ],
+            }
+        return f"{command} {jid}", summary_lines(payload, command)
 
     def cancel(self, jid: str) -> str:
         return f"Cancel request sent for job {jid}"
@@ -708,11 +758,11 @@ def handle_key(
         state.detail_lines = summarize_job(state.jobs[state.selected])
     elif key in (curses.KEY_ENTER, "\n", "\r"):
         if jid := selected_job_id(state):
-            state.detail_title, state.detail_lines = client.json_command("job", jid)
+            state.detail_title, state.detail_lines = client.detail_summary("job", jid)
             state.status = f"Loaded job {jid}"
     elif key in ("h", "H"):
         if jid := selected_job_id(state):
-            state.detail_title, state.detail_lines = client.json_command("history", jid)
+            state.detail_title, state.detail_lines = client.detail_summary("history", jid)
             state.status = f"Loaded history {jid}"
     elif key in ("s", "S"):
         submit_flow(stdscr, state, client)
