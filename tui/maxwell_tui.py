@@ -135,6 +135,92 @@ def job_time(job: dict[str, Any]) -> str:
     )
 
 
+def response_job(payload: dict[str, Any]) -> dict[str, Any]:
+    job = payload.get("jobs", [{}])
+    if isinstance(job, list):
+        return job[0] if job and isinstance(job[0], dict) else {}
+    if isinstance(job, dict):
+        return job
+    direct = payload.get("job", payload)
+    return direct if isinstance(direct, dict) else {}
+
+
+def state_reason(job: dict[str, Any]) -> str:
+    state = job.get("state")
+    if isinstance(state, dict):
+        return first_scalar(state.get("reason"))
+    return first_scalar(job.get("state_reason"))
+
+
+def exit_status(job: dict[str, Any]) -> str:
+    exit_code = job.get("exit_code")
+    if isinstance(exit_code, dict):
+        status = exit_code.get("status")
+        return first_scalar(status)
+    return "-"
+
+
+def stdout_path(job: dict[str, Any]) -> str:
+    return first_scalar(
+        job.get("stdout_expanded", job.get("standard_output", job.get("stdout")))
+    )
+
+
+def requested_tres(job: dict[str, Any]) -> str:
+    if value := job.get("tres_req_str"):
+        return first_scalar(value)
+    tres = job.get("tres")
+    if isinstance(tres, dict):
+        return tres_list(tres.get("requested"))
+    return "-"
+
+
+def allocated_tres(job: dict[str, Any]) -> str:
+    if value := job.get("tres_alloc_str"):
+        return first_scalar(value)
+    tres = job.get("tres")
+    if isinstance(tres, dict):
+        return tres_list(tres.get("allocated"))
+    return "-"
+
+
+def summary_lines(payload: dict[str, Any], source: str) -> list[str]:
+    job = response_job(payload)
+    if not job:
+        return ["No job data returned."]
+    if source == "history":
+        state = first_scalar((job.get("state") or {}).get("current") if isinstance(job.get("state"), dict) else job.get("state"))
+        submit_time = epoch_time((job.get("time") or {}).get("submission") if isinstance(job.get("time"), dict) else None)
+        start_time = epoch_time((job.get("time") or {}).get("start") if isinstance(job.get("time"), dict) else None)
+        end_time = epoch_time((job.get("time") or {}).get("end") if isinstance(job.get("time"), dict) else None)
+        elapsed = first_scalar((job.get("time") or {}).get("elapsed") if isinstance(job.get("time"), dict) else None)
+        nodes = first_scalar(job.get("nodes"))
+    else:
+        state = job_state(job)
+        submit_time = epoch_time(job.get("submit_time"))
+        start_time = epoch_time(job.get("start_time"))
+        end_time = epoch_time(job.get("end_time"))
+        elapsed = job_time(job)
+        nodes = first_scalar(job.get("nodes"))
+    fields = [
+        ("job_id", job_id(job)),
+        ("name", job_name(job)),
+        ("state", state),
+        ("reason", state_reason(job)),
+        ("partition", job_partition(job)),
+        ("nodes", nodes),
+        ("submit", submit_time),
+        ("start", start_time),
+        ("end", end_time),
+        ("elapsed", elapsed),
+        ("requested", requested_tres(job)),
+        ("allocated", allocated_tres(job)),
+        ("stdout", stdout_path(job)),
+        ("exit", exit_status(job)),
+    ]
+    return [f"{key}: {value}" for key, value in fields if value != "-"]
+
+
 @dataclass
 class CommandResult:    
     """represents the result of a command execution"""
