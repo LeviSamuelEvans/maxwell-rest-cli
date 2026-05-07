@@ -136,7 +136,7 @@ assert_contains() {
 zsh -n "$ROOT/bin/maxwell"
 zsh -n "$ROOT/bin/maxwell-tui"
 python3 -m py_compile "$ROOT/tui/maxwell_tui.py"
-"$ROOT/bin/maxwell-tui" --self-test-keys >/dev/null
+"$ROOT/bin/maxwell-tui" --self-test-keys >/dev/null || exit 1
 
 "$ROOT/bin/maxwell" init --user alice >/dev/null
 assert_contains "MAXWELL_USER=alice" "$CONFIG_DIR/config.env"
