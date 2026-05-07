@@ -1,0 +1,7 @@
+#!/usr/bin/env zsh
+
+set -u
+
+ROOT="${0:A:h:h}"
+export MAXWELL_BIN="${MAXWELL_BIN:-$ROOT/bin/maxwell}"
+exec python3 "$ROOT/tui/maxwell_tui.py" "$@"
