@@ -73,6 +73,42 @@ def first_scalar(value: Any, default: str = "-") -> str:
     return str(value)
 
 
+def numeric_value(value: Any, default: str = "-") -> str:
+    if isinstance(value, dict):
+        if value.get("infinite"):
+            return "infinite"
+        if "number" in value:
+            return first_scalar(value.get("number"), default)
+    return first_scalar(value, default)
+
+
+def epoch_time(value: Any) -> str:
+    raw = numeric_value(value)
+    if raw == "-":
+        return "-"
+    try:
+        number = int(float(raw))
+    except ValueError:
+        return raw
+    if number <= 0:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(number))
+
+
+def tres_list(value: Any) -> str:
+    if not isinstance(value, list):
+        return first_scalar(value)
+    parts = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("type")
+        count = item.get("count")
+        if name and count is not None:
+            parts.append(f"{name}={count}")
+    return ",".join(parts) if parts else "-"
+
+
 def job_id(job: dict[str, Any]) -> str:
     return first_scalar(job.get("job_id", job.get("id")))
 
