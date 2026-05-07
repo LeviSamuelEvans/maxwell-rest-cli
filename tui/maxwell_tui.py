@@ -787,8 +787,13 @@ def self_test_keys() -> None:
     assert state.selected == 0
     handle_key(None, state, client, "\n")  # type: ignore[arg-type]
     assert state.detail_title == "job 1"
+    assert "requested: cpu=1,mem=1000M,node=1,billing=1" in state.detail_lines
+    assert "allocated: cpu=40,node=1,billing=40" in state.detail_lines
+    assert "stdout: /home/alice/slurm-1.out" in state.detail_lines
     handle_key(None, state, client, "h")  # type: ignore[arg-type]
     assert state.detail_title == "history 1"
+    assert "state: COMPLETED" in state.detail_lines
+    assert "requested: cpu=1,mem=1000M,node=1,billing=1" in state.detail_lines
     handle_key(None, state, client, "r")  # type: ignore[arg-type]
     assert client.refreshes == 2
     handle_key(None, state, client, "q")  # type: ignore[arg-type]
