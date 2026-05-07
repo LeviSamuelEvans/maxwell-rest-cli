@@ -1,0 +1,685 @@
+#!/usr/bin/env zsh
+
+set -u
+
+CONFIG_DIR="${MAXWELL_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/maxwell-rest}"
+CONFIG_FILE="${MAXWELL_CONFIG_FILE:-$CONFIG_DIR/config.env}"
+CACHE_FILE="${MAXWELL_CACHE_FILE:-$CONFIG_DIR/cache.env}"
+PORTAL_SERVICE="${MAXWELL_PORTAL_SERVICE:-maxwell-rest.portal-token}"
+SLURM_SERVICE="${MAXWELL_SLURM_SERVICE:-maxwell-rest.slurm-token}"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  maxwell init [--user USER] [--workdir PATH] [--partition PARTITION]
+  maxwell auth login
+  maxwell auth refresh
+  maxwell auth logout
+  maxwell submit <script.sh> [--name NAME] [--partition PARTITION] [--time SECONDS] [--cpus N] [--tasks N] [--mem MB] [--account ACCOUNT] [--output PATH] [--cwd PATH] [--env KEY=VALUE ...] [--dry-run] [--json]
+  maxwell jobs [--user USER] [--json]
+  maxwell job <jobid> [--json]
+  maxwell history <jobid> [--json]
+  maxwell cancel <jobid> [--signal SIGNAL] [--json]
+  maxwell watch <jobid> [--interval SECONDS] [--json]
+  maxwell doctor [--json]
+
+Environment overrides:
+  MAXWELL_CONFIG_DIR, MAXWELL_CONFIG_FILE, MAXWELL_CACHE_FILE
+EOF
+}
+
+die() {
+  print -u2 -- "maxwell: $*"
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+now_epoch() {
+  date +%s
+}
+
+trim() {
+  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'
+}
+
+shell_quote() {
+  printf "%q" "$1"
+}
+
+is_positive_int() {
+  [[ "$1" =~ '^[1-9][0-9]*$' ]]
+}
+
+write_config() {
+  local user="$1" workdir="$2" partition="$3"
+  mkdir -p "$CONFIG_DIR" || die "could not create $CONFIG_DIR"
+  {
+    print -- "MAXWELL_USER=$(shell_quote "$user")"
+    print -- "MAXWELL_BASE_URL=https://max-slurm-rest.desy.de"
+    print -- "MAXWELL_API_VERSION=v0.0.44"
+    print -- "MAXWELL_DEFAULT_PARTITION=$(shell_quote "$partition")"
+    print -- "MAXWELL_DEFAULT_WORKDIR=$(shell_quote "$workdir")"
+    print -- "MAXWELL_TOKEN_LIFESPAN=84400"
+  } > "$CONFIG_FILE" || die "could not write $CONFIG_FILE"
+}
+
+write_cache_expiry() {
+  local expires_at="$1"
+  mkdir -p "$CONFIG_DIR" || die "could not create $CONFIG_DIR"
+  print -- "MAXWELL_SLURM_TOKEN_EXPIRES_AT=$expires_at" > "$CACHE_FILE" || die "could not write $CACHE_FILE"
+}
+
+load_config() {
+  [[ -f "$CONFIG_FILE" ]] || die "config not found at $CONFIG_FILE; run 'maxwell init' first"
+  source "$CONFIG_FILE"
+  [[ -n "${MAXWELL_USER:-}" ]] || die "MAXWELL_USER is missing in $CONFIG_FILE"
+  [[ -n "${MAXWELL_BASE_URL:-}" ]] || die "MAXWELL_BASE_URL is missing in $CONFIG_FILE"
+  [[ -n "${MAXWELL_API_VERSION:-}" ]] || die "MAXWELL_API_VERSION is missing in $CONFIG_FILE"
+  [[ -n "${MAXWELL_DEFAULT_PARTITION:-}" ]] || MAXWELL_DEFAULT_PARTITION="allcpu"
+  [[ -n "${MAXWELL_DEFAULT_WORKDIR:-}" ]] || MAXWELL_DEFAULT_WORKDIR="/home/$MAXWELL_USER"
+  [[ -n "${MAXWELL_TOKEN_LIFESPAN:-}" ]] || MAXWELL_TOKEN_LIFESPAN="84400"
+  if [[ -f "$CACHE_FILE" ]]; then
+    source "$CACHE_FILE"
+  fi
+}
+
+api_base() {
+  print -- "${MAXWELL_BASE_URL%/}/sapi"
+}
+
+keychain_get() {
+  local service="$1"
+  security find-generic-password -a "$MAXWELL_USER" -s "$service" -w 2>/dev/null
+}
+
+keychain_set() {
+  local service="$1" secret="$2"
+  security add-generic-password -a "$MAXWELL_USER" -s "$service" -w "$secret" -U >/dev/null
+}
+
+keychain_delete() {
+  local service="$1"
+  security delete-generic-password -a "$MAXWELL_USER" -s "$service" >/dev/null 2>&1 || true
+}
+
+extract_token() {
+  local response="$1" token
+  token="$(printf "%s" "$response" | jq -er '.token // .portal_token // .access_token // empty' 2>/dev/null || true)"
+  if [[ -z "$token" ]]; then
+    token="$(printf "%s" "$response" | trim)"
+  fi
+  [[ -n "$token" ]] || die "token response did not contain a token"
+  print -- "$token"
+}
+
+curl_basic_auth() {
+  local label="$1" secret="$2" url="$3"
+  local response rc http_status body netrc_file host
+  host="${url#https://}"
+  host="${host#http://}"
+  host="${host%%/*}"
+  netrc_file="$(mktemp "${TMPDIR:-/tmp}/maxwell-auth.XXXXXX.netrc")" || die "could not create temp auth file"
+  chmod 600 "$netrc_file" || {
+    rm -f "$netrc_file"
+    die "could not protect temp auth file"
+  }
+  {
+    print -- "machine $host"
+    print -- "login $MAXWELL_USER"
+    print -- "password $secret"
+  } > "$netrc_file" || {
+    rm -f "$netrc_file"
+    die "could not write temp auth file"
+  }
+
+  response="$(curl -sSL --netrc-file "$netrc_file" -w $'\n%{http_code}' "$url")"
+  rc=$?
+  rm -f "$netrc_file"
+  [[ "$rc" -eq 0 ]] || die "$label request failed (curl exit $rc)"
+
+  http_status="$(printf "%s" "$response" | tail -n 1)"
+  body="$(printf "%s" "$response" | sed '$d')"
+  if [[ ! "$http_status" =~ '^2[0-9][0-9]$' ]]; then
+    if [[ "$http_status" == "401" ]]; then
+      die "$label request failed (HTTP 401; check MAXWELL_USER=$MAXWELL_USER in $CONFIG_FILE and the DESY password/token)"
+    fi
+    die "$label request failed (HTTP $http_status)"
+  fi
+
+  print -- "$body"
+}
+
+ensure_slurm_token() {
+  local token expires_at now
+  token="$(keychain_get "$SLURM_SERVICE" || true)"
+  expires_at="${MAXWELL_SLURM_TOKEN_EXPIRES_AT:-0}"
+  now="$(now_epoch)"
+  if [[ -n "$token" && "$expires_at" =~ '^[0-9]+$' && "$expires_at" -gt "$((now + 60))" ]]; then
+    print -- "$token"
+    return 0
+  fi
+  cmd_auth_refresh quiet
+  keychain_get "$SLURM_SERVICE" || die "could not read refreshed Slurm token"
+}
+
+curl_api() {
+  local method="$1" endpoint="$2" data_file="${3:-}"
+  local slurm_token url
+  slurm_token="$(ensure_slurm_token)"
+  url="$(api_base)$endpoint"
+
+  local -a args
+  args=(-fsSL -X "$method")
+  args+=(-H "Content-Type: application/json")
+  args+=(-H "Accept: application/json")
+  args+=(-H "X-SLURM-USER-NAME: $MAXWELL_USER")
+  args+=(-H "X-SLURM-USER-TOKEN: $slurm_token")
+  if [[ -n "$data_file" ]]; then
+    args+=(--data-binary "@$data_file")
+  fi
+  args+=("$url")
+  curl "${args[@]}"
+}
+
+json_or_table_submit() {
+  local json="$1" raw="$2"
+  if [[ "$raw" == "1" ]]; then
+    print -- "$json"
+    return
+  fi
+  printf "%s\n" "$json" | jq -r '
+    if .job_id then
+      "Submitted job \(.job_id)"
+    elif .result.job_id then
+      "Submitted job \(.result.job_id)"
+    else
+      .
+    end
+  '
+}
+
+validate_submit_response() {
+  local json="$1"
+  printf "%s\n" "$json" | jq -e '(.job_id // .result.job_id // empty) != ""' >/dev/null
+}
+
+job_current_state() {
+  local json="$1"
+  printf "%s\n" "$json" | jq -r '
+    def scalar(x): if (x | type) == "array" then (x[0] // "") else (x // "") end;
+    (.jobs[0] // .job // .) as $j |
+    scalar($j.job_state // $j.state.current // $j.state)
+  '
+}
+
+is_terminal_state() {
+  case "$1" in
+    COMPLETED|CANCELLED|FAILED|TIMEOUT|PREEMPTED|BOOT_FAIL|DEADLINE|NODE_FAIL|OUT_OF_MEMORY|REVOKED|SPECIAL_EXIT) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+watch_final_summary() {
+  local json="$1"
+  printf "%s\n" "$json" | jq -r '
+    .jobs[0] as $j |
+    "final_state=\(($j.state.current // $j.job_state // ["unknown"])[0])",
+    "exit=\(($j.exit_code.status // ["unknown"])[0])",
+    "elapsed=\($j.time.elapsed // "-")",
+    "stdout=\($j.stdout_expanded // $j.standard_output // "-")"
+  '
+}
+
+build_submit_payload() {
+  local script="$1" name="$2" partition="$3" cwd="$4" cpus_per_task="$5" tasks="$6" mem_mb="$7" account="$8" output="$9" time_limit="${10}"
+  shift 10
+  local -a envs
+  envs=("$@")
+  jq -n \
+    --rawfile script_text "$script" \
+    --arg name "$name" \
+    --arg partition "$partition" \
+    --arg cwd "$cwd" \
+    --arg cpus_per_task "$cpus_per_task" \
+    --arg tasks "$tasks" \
+    --arg mem_mb "$mem_mb" \
+    --arg account "$account" \
+    --arg output "$output" \
+    --argjson env "$(printf "%s\n" "${envs[@]}" | jq -R . | jq -s .)" \
+    --arg time_limit "$time_limit" '
+      {
+        job: {
+          partition: $partition,
+          name: $name,
+          current_working_directory: $cwd,
+          environment: $env,
+          cpus_per_task: ($cpus_per_task | tonumber),
+          tasks: ($tasks | tonumber),
+          memory_per_node: {set: true, number: ($mem_mb | tonumber)}
+        },
+        script: $script_text
+      }
+      | if $time_limit != "" then
+          .job.time_limit = {set: true, number: ($time_limit | tonumber)}
+        else . end
+      | if $account != "" then .job.account = $account else . end
+      | if $output != "" then .job.standard_output = $output else . end
+    '
+}
+
+jobs_filter() {
+  local json="$1" user="$2"
+  if [[ -n "$user" ]]; then
+    printf "%s\n" "$json" | jq --arg user "$user" '
+      if .jobs then .jobs |= map(select(.user_name == $user or .user == $user)) else . end
+    '
+  else
+    print -- "$json"
+  fi
+}
+
+jobs_table() {
+  jq -r '
+    def scalar(x): if (x | type) == "array" then (x[0] // "-") else (x // "-") end;
+    def pick_state: scalar(.job_state // .state);
+    def pick_partition: scalar(.partition);
+    def pick_name: .name // .job_name // "-";
+    def pick_user: .user_name // .user // "-";
+    def pick_time: scalar(.time_used // .run_time // .time_limit);
+    (["JOBID","STATE","PARTITION","NAME","USER","TIME"] | @tsv),
+    ((.jobs // [])[] | [
+      (.job_id // .id // "-"),
+      pick_state,
+      pick_partition,
+      pick_name,
+      pick_user,
+      pick_time
+    ] | @tsv)
+  ' | column -t -s $'\t'
+}
+
+job_table() {
+  jq -r '
+    (.jobs[0] // .job // .) as $j |
+    [
+      ["job_id", (($j.job_id // $j.id // "-")|tostring)],
+      ["name", (($j.name // $j.job_name // "-")|tostring)],
+      ["state", (($j.job_state // $j.state // "-")|tostring)],
+      ["partition", (($j.partition // "-")|tostring)],
+      ["user", (($j.user_name // $j.user // "-")|tostring)],
+      ["nodes", (($j.nodes // "-")|tostring)],
+      ["submit_time", (($j.submit_time // "-")|tostring)],
+      ["start_time", (($j.start_time // "-")|tostring)],
+      ["end_time", (($j.end_time // "-")|tostring)]
+    ][] | @tsv
+  ' | column -t -s $'\t'
+}
+
+cmd_init() {
+  local user="${USER:-}" partition="allcpu" workdir=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --user) user="${2:-}"; shift 2 ;;
+      --partition) partition="${2:-}"; shift 2 ;;
+      --workdir) workdir="${2:-}"; shift 2 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown init option: $1" ;;
+    esac
+  done
+  [[ -n "$user" ]] || die "could not infer username; pass --user USER"
+  [[ -n "$workdir" ]] || workdir="/home/$user"
+  write_config "$user" "$workdir" "$partition"
+  print -- "Wrote $CONFIG_FILE"
+}
+
+cmd_auth_login() {
+  load_config
+  require_cmd curl
+  require_cmd jq
+  require_cmd security
+
+  local password response token
+  IFS= read -rs "password?DESY password for $MAXWELL_USER: "
+  print
+  [[ -n "$password" ]] || die "empty password"
+  response="$(curl_basic_auth "portal token" "$password" "${MAXWELL_BASE_URL%/}/reservation/get_new_token?cli_api=4.6.0")" || return $?
+  token="$(extract_token "$response")"
+  keychain_set "$PORTAL_SERVICE" "$token" || die "could not store portal token in Keychain"
+  print -- "Stored portal token in Keychain"
+}
+
+cmd_auth_refresh() {
+  local mode="${1:-normal}"
+  load_config
+  require_cmd curl
+  require_cmd jq
+  require_cmd security
+
+  local portal_token response slurm_token expires_at
+  portal_token="$(keychain_get "$PORTAL_SERVICE" || true)"
+  [[ -n "$portal_token" ]] || die "portal token not found; run 'maxwell auth login' first"
+  response="$(curl_basic_auth "Slurm token" "$portal_token" "${MAXWELL_BASE_URL%/}/reservation/get_new_slurm_token?cli_api=4.6.0&lifespan=$MAXWELL_TOKEN_LIFESPAN&stu=$MAXWELL_USER")" || return $?
+  slurm_token="$(extract_token "$response")"
+  keychain_set "$SLURM_SERVICE" "$slurm_token" || die "could not store Slurm token in Keychain"
+  expires_at="$(( $(now_epoch) + MAXWELL_TOKEN_LIFESPAN ))"
+  write_cache_expiry "$expires_at"
+  [[ "$mode" == "quiet" ]] || print -- "Stored Slurm token in Keychain; expires at epoch $expires_at"
+}
+
+cmd_auth_logout() {
+  load_config
+  require_cmd security
+  keychain_delete "$PORTAL_SERVICE"
+  keychain_delete "$SLURM_SERVICE"
+  rm -f "$CACHE_FILE"
+  print -- "Removed Maxwell REST tokens from Keychain"
+}
+
+cmd_auth() {
+  local sub="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  case "$sub" in
+    login) cmd_auth_login "$@" ;;
+    refresh) cmd_auth_refresh "$@" ;;
+    logout) cmd_auth_logout "$@" ;;
+    *) usage; die "expected auth subcommand: login, refresh, or logout" ;;
+  esac
+}
+
+cmd_submit() {
+  load_config
+  require_cmd jq
+
+  local script="${1:-}"
+  [[ -n "$script" ]] || die "submit requires a script path"
+  [[ -f "$script" ]] || die "script not found: $script"
+  shift
+
+  local name="${script:t}" partition="$MAXWELL_DEFAULT_PARTITION" time_limit="" cwd="$MAXWELL_DEFAULT_WORKDIR" raw="0" dry_run="0"
+  local cpus_per_task="1" tasks="1" mem_mb="1000" account="" output=""
+  local -a envs
+  envs=("PATH=/bin:/usr/bin:/usr/local/bin")
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name="${2:-}"; shift 2 ;;
+      --partition) partition="${2:-}"; shift 2 ;;
+      --time) time_limit="${2:-}"; shift 2 ;;
+      --cpus) cpus_per_task="${2:-}"; shift 2 ;;
+      --tasks) tasks="${2:-}"; shift 2 ;;
+      --mem) mem_mb="${2:-}"; shift 2 ;;
+      --account) account="${2:-}"; shift 2 ;;
+      --output) output="${2:-}"; shift 2 ;;
+      --cwd) cwd="${2:-}"; shift 2 ;;
+      --env) envs+=("${2:-}"); shift 2 ;;
+      --dry-run) dry_run="1"; shift ;;
+      --json) raw="1"; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown submit option: $1" ;;
+    esac
+  done
+  is_positive_int "$cpus_per_task" || die "--cpus must be a positive integer"
+  is_positive_int "$tasks" || die "--tasks must be a positive integer"
+  is_positive_int "$mem_mb" || die "--mem must be a positive integer number of MB"
+  [[ -z "$time_limit" ]] || is_positive_int "$time_limit" || die "--time must be a positive integer number of seconds"
+
+  local response tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/maxwell-submit.XXXXXX.json")" || die "could not create temp file"
+  build_submit_payload "$script" "$name" "$partition" "$cwd" "$cpus_per_task" "$tasks" "$mem_mb" "$account" "$output" "$time_limit" "${envs[@]}" > "$tmp" || {
+      rm -f "$tmp"
+      die "could not construct job payload"
+    }
+  if [[ "$dry_run" == "1" ]]; then
+    cat "$tmp"
+    rm -f "$tmp"
+    return 0
+  fi
+  require_cmd curl
+  require_cmd security
+
+  response="$(curl_api POST "/slurm/$MAXWELL_API_VERSION/job/submit" "$tmp")" || {
+    rm -f "$tmp"
+    die "job submission failed"
+  }
+  rm -f "$tmp"
+  validate_submit_response "$response" || die "job submission did not return a job id: $(printf "%s" "$response" | jq -c '.')"
+  json_or_table_submit "$response" "$raw"
+}
+
+cmd_watch() {
+  load_config
+  require_cmd curl
+  require_cmd jq
+  require_cmd security
+
+  local jobid="${1:-}" interval="10" raw="0"
+  [[ -n "$jobid" ]] || die "watch requires a job id"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --interval) interval="${2:-}"; shift 2 ;;
+      --json) raw="1"; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown watch option: $1" ;;
+    esac
+  done
+  is_positive_int "$interval" || die "--interval must be a positive integer"
+
+  local response state last_state="" source
+  while true; do
+    source="active"
+    response="$(curl_api GET "/slurm/$MAXWELL_API_VERSION/job/$jobid" 2>/dev/null)" || {
+      source="history"
+      response="$(curl_api GET "/slurmdb/$MAXWELL_API_VERSION/job/$jobid" 2>/dev/null)" || die "job not found in active jobs or history"
+    }
+    state="$(job_current_state "$response")"
+    if [[ "$raw" == "1" ]]; then
+      print -- "$response"
+    elif [[ "$state" != "$last_state" ]]; then
+      print -- "$(date '+%Y-%m-%d %H:%M:%S') $jobid $state ($source)"
+      last_state="$state"
+    fi
+    if is_terminal_state "$state"; then
+      if [[ "$source" != "history" ]]; then
+        response="$(curl_api GET "/slurmdb/$MAXWELL_API_VERSION/job/$jobid" 2>/dev/null)" || true
+      fi
+      watch_final_summary "$response"
+      return 0
+    fi
+    sleep "$interval"
+  done
+}
+
+doctor_check() {
+  local name="$1" check_status="$2" detail="$3"
+  jq -n --arg name "$name" --arg status "$check_status" --arg detail "$detail" '{name:$name,status:$status,detail:$detail}'
+}
+
+cmd_doctor() {
+  load_config
+  require_cmd jq
+
+  local raw="0"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) raw="1"; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown doctor option: $1" ;;
+    esac
+  done
+
+  local -a checks
+  checks=()
+  checks+=("$(doctor_check "config" "ok" "$CONFIG_FILE")")
+  for cmd in curl jq security column; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+      checks+=("$(doctor_check "cmd:$cmd" "ok" "$(command -v "$cmd")")")
+    else
+      checks+=("$(doctor_check "cmd:$cmd" "fail" "missing required command")")
+    fi
+  done
+
+  local portal_token slurm_token expires_at now response api_status
+  portal_token="$(keychain_get "$PORTAL_SERVICE" || true)"
+  [[ -n "$portal_token" ]] && checks+=("$(doctor_check "portal-token" "ok" "stored in Keychain")") || checks+=("$(doctor_check "portal-token" "warn" "missing; run maxwell auth login")")
+
+  slurm_token="$(keychain_get "$SLURM_SERVICE" || true)"
+  if [[ -n "$slurm_token" ]]; then
+    expires_at="${MAXWELL_SLURM_TOKEN_EXPIRES_AT:-0}"
+    now="$(now_epoch)"
+    if [[ "$expires_at" =~ '^[0-9]+$' && "$expires_at" -gt "$now" ]]; then
+      checks+=("$(doctor_check "slurm-token" "ok" "expires in $((expires_at - now)) seconds")")
+    else
+      checks+=("$(doctor_check "slurm-token" "warn" "missing or expired cache; run maxwell auth refresh")")
+    fi
+  else
+    checks+=("$(doctor_check "slurm-token" "warn" "missing; run maxwell auth refresh")")
+  fi
+
+  if [[ -n "$slurm_token" ]]; then
+    response="$(curl_api GET "/slurm/$MAXWELL_API_VERSION/jobs" 2>/dev/null)" && api_status="ok" || api_status="fail"
+    if [[ "$api_status" == "ok" ]]; then
+      checks+=("$(doctor_check "slurm-api" "ok" "$MAXWELL_BASE_URL/sapi/slurm/$MAXWELL_API_VERSION/jobs")")
+    else
+      checks+=("$(doctor_check "slurm-api" "fail" "could not fetch jobs with $MAXWELL_API_VERSION")")
+    fi
+  fi
+
+  if [[ "$raw" == "1" ]]; then
+    printf "%s\n" "${checks[@]}" | jq -s '{checks: .}'
+  else
+    printf "%s\n" "${checks[@]}" | jq -r '. | "\(.status)\t\(.name)\t\(.detail)"' | column -t -s $'\t'
+  fi
+}
+
+cmd_jobs() {
+  load_config
+  require_cmd curl
+  require_cmd jq
+  require_cmd security
+  require_cmd column
+
+  local user="$MAXWELL_USER" raw="0"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --user) user="${2:-}"; shift 2 ;;
+      --json) raw="1"; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown jobs option: $1" ;;
+    esac
+  done
+
+  local response filtered
+  response="$(curl_api GET "/slurm/$MAXWELL_API_VERSION/jobs")" || die "job list request failed"
+  filtered="$(jobs_filter "$response" "$user")"
+  if [[ "$raw" == "1" ]]; then
+    print -- "$filtered"
+  else
+    print -- "$filtered" | jobs_table
+  fi
+}
+
+cmd_job() {
+  load_config
+  require_cmd curl
+  require_cmd jq
+  require_cmd security
+  require_cmd column
+
+  local jobid="${1:-}" raw="0"
+  [[ -n "$jobid" ]] || die "job requires a job id"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) raw="1"; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown job option: $1" ;;
+    esac
+  done
+
+  local response
+  response="$(curl_api GET "/slurm/$MAXWELL_API_VERSION/job/$jobid")" || die "job request failed"
+  if [[ "$raw" == "1" ]]; then
+    print -- "$response"
+  else
+    print -- "$response" | job_table
+  fi
+}
+
+cmd_history() {
+  load_config
+  require_cmd curl
+  require_cmd jq
+  require_cmd security
+  require_cmd column
+
+  local jobid="${1:-}" raw="0"
+  [[ -n "$jobid" ]] || die "history requires a job id"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) raw="1"; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown history option: $1" ;;
+    esac
+  done
+
+  local response
+  response="$(curl_api GET "/slurmdb/$MAXWELL_API_VERSION/job/$jobid")" || die "history request failed"
+  if [[ "$raw" == "1" ]]; then
+    print -- "$response"
+  else
+    print -- "$response" | job_table
+  fi
+}
+
+cmd_cancel() {
+  load_config
+  require_cmd curl
+  require_cmd jq
+  require_cmd security
+
+  local jobid="${1:-}" signal="" raw="0"
+  [[ -n "$jobid" ]] || die "cancel requires a job id"
+  shift
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --signal) signal="${2:-}"; shift 2 ;;
+      --json) raw="1"; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown cancel option: $1" ;;
+    esac
+  done
+
+  local endpoint="/slurm/$MAXWELL_API_VERSION/job/$jobid" response
+  [[ -n "$signal" ]] && endpoint="$endpoint?signal=$signal"
+  response="$(curl_api DELETE "$endpoint")" || die "cancel request failed"
+  if [[ "$raw" == "1" ]]; then
+    print -- "$response"
+  else
+    print -- "Cancel request sent for job $jobid"
+  fi
+}
+
+main() {
+  local cmd="${1:-}"
+  [[ $# -gt 0 ]] && shift
+  case "$cmd" in
+    init) cmd_init "$@" ;;
+    auth) cmd_auth "$@" ;;
+    submit) cmd_submit "$@" ;;
+    jobs) cmd_jobs "$@" ;;
+    job) cmd_job "$@" ;;
+    history) cmd_history "$@" ;;
+    cancel) cmd_cancel "$@" ;;
+    watch) cmd_watch "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    -h|--help|"") usage ;;
+    *) usage; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
