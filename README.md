@@ -49,6 +49,24 @@ Preview the exact Slurm REST payload without submitting:
 ./bin/maxwell submit job.sh --name testapi --time 1000 --dry-run
 ```
 
+Request GPUs with `--gres`. The value follows Slurm's `gpu:N` or `gpu:<type>:N` form and is sent to the REST API as `tres_per_node: gres/<value>`:
+
+```sh
+./bin/maxwell submit examples/maxwell-gpu-test-job.sh \
+  --name gpu-smoke --partition maxgpu --gres gpu:1 \
+  --time 600 --cpus 2 --mem 4000
+```
+
+Use `--dry-run` to preview the payload before submitting.
+
+### Discover GPU resources
+
+```sh
+./bin/maxwell partitions --gpu       # partitions that advertise gres/gpu
+./bin/maxwell nodes --gpu            # per-node gres + gres_used (what's free)
+./bin/maxwell nodes --partition maxgpu --json | jq '.nodes[] | {name, state, gres, gres_used}'
+```
+
 You can list your running/queue jobs like so:
 
 ```sh
