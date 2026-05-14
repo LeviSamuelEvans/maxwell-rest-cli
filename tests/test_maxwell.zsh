@@ -64,12 +64,21 @@ set -u
 print -r -- "$*" >> "$MOCK_LOG"
 last="${@: -1}"
 with_status=0
+output_file=""
 for arg in "$@"; do
   [[ "$arg" == "-w" ]] && with_status=1
 done
+for (( i = 1; i <= $#; i++ )); do
+  # Match curl's -o behavior: the body goes to a file, while -w prints status to stdout.
+  [[ "${@[i]}" == "-o" ]] && output_file="${@[i+1]}"
+done
 emit() {
   local body="$1" code="${2:-200}"
-  print -r -- "$body"
+  if [[ -n "$output_file" ]]; then
+    print -r -- "$body" > "$output_file"
+  else
+    print -r -- "$body"
+  fi
   [[ "$with_status" == "1" ]] && print -r -- "$code"
   return 0
 }
