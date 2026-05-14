@@ -15,7 +15,7 @@ Usage:
   maxwell auth login
   maxwell auth refresh
   maxwell auth logout
-  maxwell submit <script.sh> [--name NAME] [--partition PARTITION] [--time SECONDS] [--cpus N] [--tasks N] [--mem MB] [--account ACCOUNT] [--output PATH] [--cwd PATH] [--env KEY=VALUE ...] [--dry-run] [--json]
+  maxwell submit <script.sh> [--name NAME] [--partition PARTITION] [--time SECONDS] [--cpus N] [--tasks N] [--mem MB] [--gres SPEC] [--account ACCOUNT] [--output PATH] [--cwd PATH] [--env KEY=VALUE ...] [--dry-run] [--json]
   maxwell jobs [--user USER] [--json]
   maxwell job <jobid> [--json]
   maxwell history <jobid> [--json]
@@ -258,8 +258,8 @@ watch_final_summary() {
 }
 
 build_submit_payload() {
-  local script="$1" name="$2" partition="$3" cwd="$4" cpus_per_task="$5" tasks="$6" mem_mb="$7" account="$8" output="$9" time_limit="${10}"
-  shift 10
+  local script="$1" name="$2" partition="$3" cwd="$4" cpus_per_task="$5" tasks="$6" mem_mb="$7" account="$8" output="$9" time_limit="${10}" gres="${11}"
+  shift 11
   local -a envs
   envs=("$@")
   jq -n \
@@ -272,6 +272,7 @@ build_submit_payload() {
     --arg mem_mb "$mem_mb" \
     --arg account "$account" \
     --arg output "$output" \
+    --arg gres "$gres" \
     --argjson env "$(printf "%s\n" "${envs[@]}" | jq -R . | jq -s .)" \
     --arg time_limit "$time_limit" '
       {
@@ -291,6 +292,7 @@ build_submit_payload() {
         else . end
       | if $account != "" then .job.account = $account else . end
       | if $output != "" then .job.standard_output = $output else . end
+      | if $gres != "" then .job.gres_per_node = $gres else . end
     '
 }
 
@@ -423,7 +425,7 @@ cmd_submit() {
   shift
 
   local name="${script:t}" partition="$MAXWELL_DEFAULT_PARTITION" time_limit="" cwd="$MAXWELL_DEFAULT_WORKDIR" raw="0" dry_run="0"
-  local cpus_per_task="1" tasks="1" mem_mb="1000" account="" output=""
+  local cpus_per_task="1" tasks="1" mem_mb="1000" account="" output="" gres=""
   local -a envs
   envs=("PATH=/bin:/usr/bin:/usr/local/bin")
 
@@ -435,6 +437,7 @@ cmd_submit() {
       --cpus) cpus_per_task="${2:-}"; shift 2 ;;
       --tasks) tasks="${2:-}"; shift 2 ;;
       --mem) mem_mb="${2:-}"; shift 2 ;;
+      --gres) gres="${2:-}"; shift 2 ;;
       --account) account="${2:-}"; shift 2 ;;
       --output) output="${2:-}"; shift 2 ;;
       --cwd) cwd="${2:-}"; shift 2 ;;
@@ -449,10 +452,11 @@ cmd_submit() {
   is_positive_int "$tasks" || die "--tasks must be a positive integer"
   is_positive_int "$mem_mb" || die "--mem must be a positive integer number of MB"
   [[ -z "$time_limit" ]] || is_positive_int "$time_limit" || die "--time must be a positive integer number of seconds"
+  [[ -z "$gres" ]] || [[ "$gres" =~ '^[A-Za-z][A-Za-z0-9_]*(:[A-Za-z0-9_]+)*:[0-9]+$' ]] || die "--gres must look like gpu:N or gpu:<type>:N (got: $gres)"
 
   local response tmp
   tmp="$(mktemp "${TMPDIR:-/tmp}/maxwell-submit.XXXXXX.json")" || die "could not create temp file"
-  build_submit_payload "$script" "$name" "$partition" "$cwd" "$cpus_per_task" "$tasks" "$mem_mb" "$account" "$output" "$time_limit" "${envs[@]}" > "$tmp" || {
+  build_submit_payload "$script" "$name" "$partition" "$cwd" "$cpus_per_task" "$tasks" "$mem_mb" "$account" "$output" "$time_limit" "$gres" "${envs[@]}" > "$tmp" || {
       rm -f "$tmp"
       die "could not construct job payload"
     }
