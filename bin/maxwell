@@ -21,6 +21,8 @@ Usage:
   maxwell history <jobid> [--json]
   maxwell cancel <jobid> [--signal SIGNAL] [--json]
   maxwell watch <jobid> [--interval SECONDS] [--json]
+  maxwell partitions [--gpu] [--json]
+  maxwell nodes [--gpu] [--partition PARTITION] [--json]
   maxwell doctor [--json]
 
 Environment overrides:
@@ -658,6 +660,127 @@ cmd_history() {
   fi
 }
 
+partitions_table() {
+  jq -r '
+    def scalar(x): if (x | type) == "array" then (x[0] // "") else (x // "") end;
+    (.partitions // []) as $ps |
+    (["PARTITION","NODES","TOTAL_CPUS","MAX_TIME","GRES"] | @tsv),
+    ($ps[] | [
+      (.name // "-"),
+      (.nodes // .nodes_online // "-" | tostring),
+      ((.cpus.total // .total_cpus // "-") | tostring),
+      ((scalar(.maximum_time) // .max_time // "-") | tostring),
+      ((.tres.configured // .tres // "")
+        | tostring
+        | capture("(?<g>gres/[A-Za-z0-9_:=]+)"; "g")
+        | map(.g) | join(",")
+        | if . == "" then "-" else . end)
+    ] | @tsv)
+  ' | column -t -s $'\t'
+}
+
+nodes_table() {
+  jq -r '
+    def scalar(x): if (x | type) == "array" then (x[0] // "") else (x // "") end;
+    def nz(x): if (x // "" | tostring) == "" then "-" else (x | tostring) end;
+    def gpu_from_features(f):
+      ( (f // []) as $f |
+        (($f | map(select(test("^GPUx[0-9]+$"))) | .[0] // "") | capture("GPUx(?<n>[0-9]+)"; "") | .n ) as $n |
+        ($f | map(select(test("^(A100|A40|A30|A10|L40S?|H100|H200|V100|P100|P40|K80|T4|RTX[0-9A-Z]+|MI[0-9]+[A-Z]*|GH200|B[0-9]+)(-.*)?$"))) | .[0] // "") as $model |
+        if $model == "" and $n == null then ""
+        elif $model == "" then "gpu:" + $n
+        elif $n == null then "gpu:" + ($model | ascii_downcase)
+        else "gpu:" + ($model | ascii_downcase) + ":" + $n end );
+    (.nodes // []) as $ns |
+    (["NODE","STATE","PARTITIONS","CPUS","GRES","GRES_USED"] | @tsv),
+    ($ns[] | [
+      (.name // "-"),
+      (scalar(.state) // .state_flags // "-" | tostring),
+      ((.partitions // []) | join(",") | if . == "" then "-" else . end),
+      ((.cpus // "-") | tostring),
+      nz((if (.gres // "") == "" then gpu_from_features(.features) else .gres end)),
+      nz(.gres_used // .gres_drain // "")
+    ] | @tsv)
+  ' | column -t -s $'\t'
+}
+
+cmd_partitions() {
+  load_config
+  require_cmd curl
+  require_cmd jq
+  require_cmd security
+  require_cmd column
+
+  local raw="0" gpu_only="0"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) raw="1"; shift ;;
+      --gpu) gpu_only="1"; shift ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown partitions option: $1" ;;
+    esac
+  done
+
+  local response filtered
+  response="$(curl_api GET "/slurm/$MAXWELL_API_VERSION/partitions")" || die "partitions request failed"
+  if [[ "$gpu_only" == "1" ]]; then
+    filtered="$(printf "%s\n" "$response" | jq '
+      .partitions |= map(select(
+        ((.tres.configured // .tres // "") | tostring | test("gres/gpu"; "i"))
+      ))
+    ')"
+  else
+    filtered="$response"
+  fi
+  if [[ "$raw" == "1" ]]; then
+    print -- "$filtered"
+  else
+    print -- "$filtered" | partitions_table
+  fi
+}
+
+cmd_nodes() {
+  load_config
+  require_cmd curl
+  require_cmd jq
+  require_cmd security
+  require_cmd column
+
+  local raw="0" gpu_only="0" partition=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) raw="1"; shift ;;
+      --gpu) gpu_only="1"; shift ;;
+      --partition) partition="${2:-}"; shift 2 ;;
+      -h|--help) usage; return 0 ;;
+      *) die "unknown nodes option: $1" ;;
+    esac
+  done
+
+  local response filtered
+  response="$(curl_api GET "/slurm/$MAXWELL_API_VERSION/nodes")" || die "nodes request failed"
+  filtered="$response"
+  if [[ "$gpu_only" == "1" ]]; then
+    filtered="$(printf "%s\n" "$filtered" | jq '
+      .nodes |= map(select(
+        ((.gres // .gres_total // .tres_fmt_str // "") | tostring | test("gpu"; "i"))
+        or ((.features // []) | any(test("gpu"; "i")))
+        or ((.partitions // []) | any(test("gpu"; "i")))
+      ))
+    ')"
+  fi
+  if [[ -n "$partition" ]]; then
+    filtered="$(printf "%s\n" "$filtered" | jq --arg p "$partition" '
+      .nodes |= map(select((.partitions // []) | index($p)))
+    ')"
+  fi
+  if [[ "$raw" == "1" ]]; then
+    print -- "$filtered"
+  else
+    print -- "$filtered" | nodes_table
+  fi
+}
+
 cmd_cancel() {
   load_config
   require_cmd curl
@@ -698,6 +821,8 @@ main() {
     history) cmd_history "$@" ;;
     cancel) cmd_cancel "$@" ;;
     watch) cmd_watch "$@" ;;
+    partitions) cmd_partitions "$@" ;;
+    nodes) cmd_nodes "$@" ;;
     doctor) cmd_doctor "$@" ;;
     -h|--help|"") usage ;;
     *) usage; die "unknown command: $cmd" ;;
