@@ -11,7 +11,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -20,15 +20,16 @@ MAXWELL_BIN = Path(os.environ.get("MAXWELL_BIN", ROOT / "bin" / "maxwell"))
 REFRESH_SECONDS = 30
 
 COLORS: dict[str, int] = {}
+JsonDict = dict[str, Any]
 
 
 def config_dir() -> Path:
     if value := os.environ.get("MAXWELL_CONFIG_DIR"):
         return Path(value).expanduser()
-    
+
     if value := os.environ.get("XDG_CONFIG_HOME"):
         return Path(value).expanduser() / "maxwell-rest"
-    
+
     return Path.home() / ".config" / "maxwell-rest"
 
 
@@ -109,33 +110,79 @@ def tres_list(value: Any) -> str:
     return ",".join(parts) if parts else "-"
 
 
-def job_id(job: dict[str, Any]) -> str:
-    return first_scalar(job.get("job_id", job.get("id")))
+def pick(job: JsonDict, *keys: str) -> str:
+    for key in keys:
+        if key in job:
+            return first_scalar(job[key])
+    return "-"
 
 
-def job_state(job: dict[str, Any]) -> str:
-    return first_scalar(job.get("job_state", job.get("state")))
+def job_id(job: JsonDict) -> str:
+    return pick(job, "job_id", "id")
 
 
-def job_name(job: dict[str, Any]) -> str:
-    return first_scalar(job.get("name", job.get("job_name")))
+def job_tres(job: JsonDict, string_key: str, nested_key: str) -> str:
+    if value := job.get(string_key):
+        return first_scalar(value)
+    tres = job.get("tres")
+    if isinstance(tres, dict):
+        return tres_list(tres.get(nested_key))
+    return "-"
 
 
-def job_user(job: dict[str, Any]) -> str:
-    return first_scalar(job.get("user_name", job.get("user")))
+def field_lines(fields: list[tuple[str, str]]) -> list[str]:
+    return [f"{key}: {value}" for key, value in fields if value != "-"]
 
 
-def job_partition(job: dict[str, Any]) -> str:
-    return first_scalar(job.get("partition"))
+@dataclass(frozen=True)
+class JobView:
+    id: str
+    state: str
+    partition: str
+    name: str
+    user: str
+    time: str
+    nodes: str = "-"
+    submit_time: str = "-"
+    start_time: str = "-"
+    end_time: str = "-"
+
+    @classmethod
+    def from_api(cls, job: JsonDict) -> "JobView":
+        return cls(
+            id=job_id(job),
+            state=pick(job, "job_state", "state"),
+            partition=pick(job, "partition"),
+            name=pick(job, "name", "job_name"),
+            user=pick(job, "user_name", "user"),
+            time=pick(job, "time_used", "run_time", "time_limit"),
+            nodes=first_scalar(job.get("nodes")),
+            submit_time=first_scalar(job.get("submit_time")),
+            start_time=first_scalar(job.get("start_time")),
+            end_time=first_scalar(job.get("end_time")),
+        )
+
+    def table_values(self) -> list[str]:
+        return [self.id, self.state, self.partition, self.name, self.user, self.time]
+
+    def summary_lines(self) -> list[str]:
+        return field_lines(
+            [
+                ("job_id", self.id),
+                ("state", self.state),
+                ("partition", self.partition),
+                ("name", self.name),
+                ("user", self.user),
+                ("time", self.time),
+                ("nodes", self.nodes),
+                ("submit_time", self.submit_time),
+                ("start_time", self.start_time),
+                ("end_time", self.end_time),
+            ]
+        )
 
 
-def job_time(job: dict[str, Any]) -> str:
-    return first_scalar(
-        job.get("time_used", job.get("run_time", job.get("time_limit")))
-    )
-
-
-def response_job(payload: dict[str, Any]) -> dict[str, Any]:
+def response_job(payload: JsonDict) -> JsonDict:
     job = payload.get("jobs", [{}])
     if isinstance(job, list):
         return job[0] if job and isinstance(job[0], dict) else {}
@@ -145,14 +192,14 @@ def response_job(payload: dict[str, Any]) -> dict[str, Any]:
     return direct if isinstance(direct, dict) else {}
 
 
-def state_reason(job: dict[str, Any]) -> str:
+def state_reason(job: JsonDict) -> str:
     state = job.get("state")
     if isinstance(state, dict):
         return first_scalar(state.get("reason"))
     return first_scalar(job.get("state_reason"))
 
 
-def exit_status(job: dict[str, Any]) -> str:
+def exit_status(job: JsonDict) -> str:
     exit_code = job.get("exit_code")
     if isinstance(exit_code, dict):
         status = exit_code.get("status")
@@ -160,54 +207,48 @@ def exit_status(job: dict[str, Any]) -> str:
     return "-"
 
 
-def stdout_path(job: dict[str, Any]) -> str:
+def stdout_path(job: JsonDict) -> str:
     return first_scalar(
         job.get("stdout_expanded", job.get("standard_output", job.get("stdout")))
     )
 
 
-def requested_tres(job: dict[str, Any]) -> str:
-    if value := job.get("tres_req_str"):
-        return first_scalar(value)
-    tres = job.get("tres")
-    if isinstance(tres, dict):
-        return tres_list(tres.get("requested"))
-    return "-"
+def requested_tres(job: JsonDict) -> str:
+    return job_tres(job, "tres_req_str", "requested")
 
 
-def allocated_tres(job: dict[str, Any]) -> str:
-    if value := job.get("tres_alloc_str"):
-        return first_scalar(value)
-    tres = job.get("tres")
-    if isinstance(tres, dict):
-        return tres_list(tres.get("allocated"))
-    return "-"
+def allocated_tres(job: JsonDict) -> str:
+    return job_tres(job, "tres_alloc_str", "allocated")
 
 
-def summary_lines(payload: dict[str, Any], source: str) -> list[str]:
+def summary_lines(payload: JsonDict, source: str) -> list[str]:
     job = response_job(payload)
     if not job:
         return ["No job data returned."]
     if source == "history":
-        state = first_scalar((job.get("state") or {}).get("current") if isinstance(job.get("state"), dict) else job.get("state"))
-        submit_time = epoch_time((job.get("time") or {}).get("submission") if isinstance(job.get("time"), dict) else None)
-        start_time = epoch_time((job.get("time") or {}).get("start") if isinstance(job.get("time"), dict) else None)
-        end_time = epoch_time((job.get("time") or {}).get("end") if isinstance(job.get("time"), dict) else None)
-        elapsed = first_scalar((job.get("time") or {}).get("elapsed") if isinstance(job.get("time"), dict) else None)
+        state_data = job.get("state")
+        time_data = job.get("time") if isinstance(job.get("time"), dict) else {}
+        state = first_scalar(
+            state_data.get("current") if isinstance(state_data, dict) else state_data
+        )
+        submit_time = epoch_time(time_data.get("submission"))
+        start_time = epoch_time(time_data.get("start"))
+        end_time = epoch_time(time_data.get("end"))
+        elapsed = first_scalar(time_data.get("elapsed"))
         nodes = first_scalar(job.get("nodes"))
     else:
-        state = job_state(job)
+        state = pick(job, "job_state", "state")
         submit_time = epoch_time(job.get("submit_time"))
         start_time = epoch_time(job.get("start_time"))
         end_time = epoch_time(job.get("end_time"))
-        elapsed = job_time(job)
+        elapsed = pick(job, "time_used", "run_time", "time_limit")
         nodes = first_scalar(job.get("nodes"))
     fields = [
         ("job_id", job_id(job)),
-        ("name", job_name(job)),
+        ("name", pick(job, "name", "job_name")),
         ("state", state),
         ("reason", state_reason(job)),
-        ("partition", job_partition(job)),
+        ("partition", pick(job, "partition")),
         ("nodes", nodes),
         ("submit", submit_time),
         ("start", start_time),
@@ -218,30 +259,79 @@ def summary_lines(payload: dict[str, Any], source: str) -> list[str]:
         ("stdout", stdout_path(job)),
         ("exit", exit_status(job)),
     ]
-    return [f"{key}: {value}" for key, value in fields if value != "-"]
+    return field_lines(fields)
 
 
 @dataclass
-class CommandResult:    
+class CommandResult:
     """represents the result of a command execution"""
     ok: bool
     output: str
     error: str = ""
 
 
+@dataclass(frozen=True)
+class SubmitRequest:
+    script: str
+    name: str
+    partition: str
+    time_limit: str
+    cpus: str
+    tasks: str
+    mem: str
+
+
+class MaxwellAPI(Protocol):
+    def jobs(self, user: str) -> tuple[list[JsonDict], str | None]: ...
+
+    def detail_summary(self, command: str, jid: str) -> tuple[str, list[str]]: ...
+
+    def cancel(self, jid: str) -> str: ...
+
+    def submit(self, request: SubmitRequest) -> str: ...
+
+
 @dataclass
 class AppState:
     """represents the state of the application"""
-    user: str
-    jobs: list[dict[str, Any]] = field(default_factory=list)
+    jobs: list[JobView] = field(default_factory=list)
     selected: int = 0
     status: str = "Press r to refresh"
     detail_title: str = "Details"
     detail_lines: list[str] = field(default_factory=list)
-    last_refresh: float = 0
     next_refresh: float = 0
     running: bool = True
     filter_user: str = ""
+
+    def selected_job(self) -> JobView | None:
+        if not self.jobs:
+            return None
+        return self.jobs[self.selected]
+
+    def selected_job_id(self) -> str | None:
+        job = self.selected_job()
+        return job.id if job else None
+
+    def show_selected_summary(self) -> None:
+        job = self.selected_job()
+        if not job:
+            self.detail_title = "Details"
+            self.detail_lines = ["No jobs for current filter."]
+            return
+        self.detail_title = f"Selected {job.id}"
+        self.detail_lines = job.summary_lines()
+
+    def replace_jobs(self, jobs: list[JsonDict]) -> None:
+        self.jobs = [JobView.from_api(job) for job in jobs]
+        if self.selected >= len(self.jobs):
+            self.selected = max(0, len(self.jobs) - 1)
+        self.show_selected_summary()
+
+    def select(self, delta: int) -> None:
+        if not self.jobs:
+            return
+        self.selected = max(0, min(len(self.jobs) - 1, self.selected + delta))
+        self.show_selected_summary()
 
 
 class MaxwellClient:
@@ -282,17 +372,6 @@ class MaxwellClient:
             return [], "jobs response did not contain a jobs list"
         return [job for job in jobs if isinstance(job, dict)], None
 
-    def json_command(self, command: str, jid: str) -> tuple[str, list[str]]:
-        result = self.run(command, jid, "--json")
-        if not result.ok:
-            return command, [result.error]
-        try:
-            payload = json.loads(result.output)
-            text = json.dumps(payload, indent=2, sort_keys=True)
-        except json.JSONDecodeError:
-            text = result.output
-        return f"{command} {jid}", text.splitlines()
-
     def detail_summary(self, command: str, jid: str) -> tuple[str, list[str]]:
         result = self.run(command, jid, "--json")
         if not result.ok:
@@ -309,31 +388,22 @@ class MaxwellClient:
             return result.output.strip() or f"Cancel request sent for job {jid}"
         return result.error
 
-    def submit(
-        self,
-        script: str,
-        name: str,
-        partition: str,
-        time_limit: str,
-        cpus: str,
-        tasks: str,
-        mem: str,
-    ) -> str:
+    def submit(self, request: SubmitRequest) -> str:
         args = [
             "submit",
-            script,
+            request.script,
             "--name",
-            name,
+            request.name,
             "--partition",
-            partition,
+            request.partition,
             "--time",
-            time_limit,
+            request.time_limit,
             "--cpus",
-            cpus,
+            request.cpus,
             "--tasks",
-            tasks,
+            request.tasks,
             "--mem",
-            mem,
+            request.mem,
             "--json",
         ]
         result = self.run(*args)
@@ -370,9 +440,6 @@ class SelfTestClient:
                 "user_name": user,
             },
         ], None
-
-    def json_command(self, command: str, jid: str) -> tuple[str, list[str]]:
-        return f"{command} {jid}", [f"{command}:{jid}"]
 
     def detail_summary(self, command: str, jid: str) -> tuple[str, list[str]]:
         payload = {
@@ -417,16 +484,7 @@ class SelfTestClient:
     def cancel(self, jid: str) -> str:
         return f"Cancel request sent for job {jid}"
 
-    def submit(
-        self,
-        script: str,
-        name: str,
-        partition: str,
-        time_limit: str,
-        cpus: str,
-        tasks: str,
-        mem: str,
-    ) -> str:
+    def submit(self, request: SubmitRequest) -> str:
         return "Submitted job 3"
 
 
@@ -460,9 +518,29 @@ def ellipsize(text: str, width: int) -> str:
 def addstr(win: curses.window, y: int, x: int, text: str, attr: int = 0) -> None:
     """adds the given text to the given window at the given coordinates with the given attributes"""
     height, width = win.getmaxyx()
-    if y < 0 or y >= height or x >= width:
+    if y < 0 or y >= height or width <= 0:
         return
-    win.addstr(y, x, ellipsize(text, width - x), attr)
+    if x >= width:
+        return
+
+    # be defensive around terminal/curses edge cases:
+    if x < 0:
+        text = text[-x:]
+        x = 0
+
+    max_width = width - x
+    if y == height - 1:
+        # avoid touching the bottom-right cell (last row, last col).
+        max_width -= 1
+    if max_width <= 0:
+        return
+
+    try:
+        win.addstr(y, x, ellipsize(text, max_width), attr)
+    except curses.error:
+        # rendering should never crash the TUI so just skip if the terminal is too small or
+        # the curses backend refuses the write for any reason.
+        return
 
 
 def init_colors() -> None:
@@ -516,42 +594,15 @@ def load_user() -> str:
     return read_env_file(config_file()).get("MAXWELL_USER", os.environ.get("USER", ""))
 
 
-def refresh_jobs(state: AppState, client: MaxwellClient) -> None:
+def refresh_jobs(state: AppState, client: MaxwellAPI) -> None:
     state.status = "Refreshing jobs..."
     jobs, error = client.jobs(state.filter_user)
-    now = time.time()
-    state.last_refresh = now
-    state.next_refresh = now + REFRESH_SECONDS
+    state.next_refresh = time.time() + REFRESH_SECONDS
     if error:
         state.status = error
         return
-    state.jobs = jobs
-    if state.selected >= len(state.jobs):
-        state.selected = max(0, len(state.jobs) - 1)
+    state.replace_jobs(jobs)
     state.status = f"{len(state.jobs)} jobs loaded"
-    if state.jobs:
-        selected = state.jobs[state.selected]
-        state.detail_title = f"Selected {job_id(selected)}"
-        state.detail_lines = summarize_job(selected)
-    else:
-        state.detail_title = "Details"
-        state.detail_lines = ["No jobs for current filter."]
-
-
-def summarize_job(job: dict[str, Any]) -> list[str]:
-    fields = [
-        ("job_id", job_id(job)),
-        ("state", job_state(job)),
-        ("partition", job_partition(job)),
-        ("name", job_name(job)),
-        ("user", job_user(job)),
-        ("time", job_time(job)),
-        ("nodes", first_scalar(job.get("nodes"))),
-        ("submit_time", first_scalar(job.get("submit_time"))),
-        ("start_time", first_scalar(job.get("start_time"))),
-        ("end_time", first_scalar(job.get("end_time"))),
-    ]
-    return [f"{key}: {value}" for key, value in fields if value != "-"]
 
 
 def draw_header(stdscr: curses.window, state: AppState) -> None:
@@ -593,16 +644,8 @@ def draw_jobs(
     for row, job in enumerate(state.jobs[start : start + visible_rows], start=top + 1):
         index = start + row - top - 1
         attr = style("selected", curses.A_REVERSE) if index == state.selected else 0
-        values = [
-            job_id(job),
-            job_state(job),
-            job_partition(job),
-            job_name(job),
-            job_user(job),
-            job_time(job),
-        ]
         x = left
-        for value, (_, col_width) in zip(values, headers):
+        for value, (_, col_width) in zip(job.table_values(), headers):
             addstr(stdscr, row, x, value.ljust(col_width), attr)
             x += col_width + 1
             if x >= left + width:
@@ -644,37 +687,37 @@ def prompt_confirm(stdscr: curses.window, message: str) -> bool:
     height, _ = stdscr.getmaxyx()
     addstr(stdscr, height - 1, 0, f"{message} [y/N]", style("status", curses.A_REVERSE))
     stdscr.refresh()
-    while True:
-        key = read_key(stdscr)
-        if key in ("y", "Y"):
-            return True
-        if key in ("n", "N", "\x1b", "\n", "\r", curses.KEY_ENTER):
-            return False
+    stdscr.timeout(-1)
+    try:
+        while True:
+            key = read_key(stdscr)
+            if key in ("y", "Y"):
+                return True
+            if key in ("n", "N", "\x1b", "\n", "\r", curses.KEY_ENTER):
+                return False
+    finally:
+        stdscr.timeout(250)
 
 
 def prompt_input(stdscr: curses.window, label: str, default: str = "") -> str | None:
+    """Read a line of input from the status bar. Blocks until Enter is pressed."""
+    height, width = stdscr.getmaxyx()
+    prompt = f"{label} [{default}]: " if default else f"{label}: "
+    addstr(stdscr, height - 1, 0, " " * max(0, width - 1), style("status", curses.A_REVERSE))
+    addstr(stdscr, height - 1, 0, prompt, style("status", curses.A_REVERSE))
+    stdscr.refresh()
+
+    stdscr.timeout(-1)
     curses.echo()
     try:
         curses.curs_set(1)
     except curses.error:
         pass
     try:
-        height, width = stdscr.getmaxyx()
-        prompt = f"{label}"
-        if default:
-            prompt += f" [{default}]"
-        prompt += ": "
-        addstr(
-            stdscr,
-            height - 1,
-            0,
-            " " * max(0, width - 1),
-            style("status", curses.A_REVERSE),
-        )
-        addstr(stdscr, height - 1, 0, prompt, style("status", curses.A_REVERSE))
-        stdscr.refresh()
         raw = stdscr.getstr(
-            height - 1, min(len(prompt), width - 1), max(1, width - len(prompt) - 1)
+            height - 1,
+            min(len(prompt), width - 1),
+            max(1, width - len(prompt) - 1),
         )
         value = raw.decode("utf-8").strip()
         return value or default
@@ -686,52 +729,37 @@ def prompt_input(stdscr: curses.window, label: str, default: str = "") -> str | 
             curses.curs_set(0)
         except curses.error:
             pass
+        stdscr.timeout(250)
 
 
-def submit_flow(stdscr: curses.window, state: AppState, client: MaxwellClient) -> None:
+def submit_flow(stdscr: curses.window, state: AppState, client: MaxwellAPI) -> None:
     script = prompt_input(stdscr, "Script path")
     if not script:
         state.status = "Submit aborted"
         return
-    default_name = Path(script).name or "maxwell-job"
-    name = prompt_input(stdscr, "Name", default_name)
-    partition = prompt_input(stdscr, "Partition", "allcpu")
-    time_limit = prompt_input(stdscr, "Time seconds", "300")
-    cpus = prompt_input(stdscr, "CPUs per task", "1")
-    tasks = prompt_input(stdscr, "Tasks", "1")
-    mem = prompt_input(stdscr, "Memory MB", "1000")
-
-    # need to do explicit checks to satisfy type narrowing (prompt_input returns Optional[str]).
-    if name is None or name == "":
-        state.status = "Submit aborted"
-        return
-    if partition is None or partition == "":
-        state.status = "Submit aborted"
-        return
-    if time_limit is None or time_limit == "":
-        state.status = "Submit aborted"
-        return
-    if cpus is None or cpus == "":
-        state.status = "Submit aborted"
-        return
-    if tasks is None or tasks == "":
-        state.status = "Submit aborted"
-        return
-    if mem is None or mem == "":
-        state.status = "Submit aborted"
-        return
+    prompts = [
+        ("Name", Path(script).name or "maxwell-job"),
+        ("Partition", "allcpu"),
+        ("Time seconds", "300"),
+        ("CPUs per task", "1"),
+        ("Tasks", "1"),
+        ("Memory MB", "1000"),
+    ]
+    values: list[str] = []
+    for label, default in prompts:
+        value = prompt_input(stdscr, label, default)
+        if not value:
+            state.status = "Submit aborted"
+            return
+        values.append(value)
+    name, partition, time_limit, cpus, tasks, mem = values
     summary = f"Submit {name} on {partition}, {tasks} task(s), {cpus} CPU/task, {mem} MB, {time_limit}s?"
     if not prompt_confirm(stdscr, summary):
         state.status = "Submit aborted"
         return
-    state.status = client.submit(script, name, partition, time_limit, cpus, tasks, mem)
+    request = SubmitRequest(script, name, partition, time_limit, cpus, tasks, mem)
+    state.status = client.submit(request)
     refresh_jobs(state, client)
-
-
-def selected_job_id(state: AppState) -> str | None:
-    if not state.jobs:
-        return None
-    return job_id(state.jobs[state.selected])
 
 
 def read_key(stdscr: curses.window) -> str | int | None:
@@ -742,61 +770,58 @@ def read_key(stdscr: curses.window) -> str | int | None:
 
 
 def handle_key(
-    stdscr: curses.window, state: AppState, client: MaxwellClient, key: str | int
+    stdscr: curses.window | None, state: AppState, client: MaxwellAPI, key: str | int
 ) -> None:
-    if key in ("q", "Q", "\x1b"):
+    k = key.lower() if isinstance(key, str) else key
+    if k == "q":
         state.running = False
-    elif key in ("r", "R"):
+    elif k == "r":
         refresh_jobs(state, client)
-    elif key in (curses.KEY_DOWN, "j", "J") and state.jobs:
-        state.selected = min(len(state.jobs) - 1, state.selected + 1)
-        state.detail_title = f"Selected {job_id(state.jobs[state.selected])}"
-        state.detail_lines = summarize_job(state.jobs[state.selected])
-    elif key in (curses.KEY_UP, "k", "K") and state.jobs:
-        state.selected = max(0, state.selected - 1)
-        state.detail_title = f"Selected {job_id(state.jobs[state.selected])}"
-        state.detail_lines = summarize_job(state.jobs[state.selected])
-    elif key in (curses.KEY_ENTER, "\n", "\r"):
-        if jid := selected_job_id(state):
+    elif k in (curses.KEY_DOWN, "j"):
+        state.select(+1)
+    elif k in (curses.KEY_UP, "k"):
+        state.select(-1)
+    elif k in (curses.KEY_ENTER, "\n", "\r"):
+        if jid := state.selected_job_id():
             state.detail_title, state.detail_lines = client.detail_summary("job", jid)
             state.status = f"Loaded job {jid}"
-    elif key in ("h", "H"):
-        if jid := selected_job_id(state):
+    elif k == "h":
+        if jid := state.selected_job_id():
             state.detail_title, state.detail_lines = client.detail_summary("history", jid)
             state.status = f"Loaded history {jid}"
-    elif key in ("s", "S"):
-        submit_flow(stdscr, state, client)
-    elif key in ("c", "C"):
-        if (jid := selected_job_id(state)) and prompt_confirm(
-            stdscr, f"Cancel job {jid}?"
-        ):
+    elif k == "s":
+        if stdscr is not None:
+            submit_flow(stdscr, state, client)
+    elif k == "c":
+        jid = state.selected_job_id()
+        if stdscr is not None and jid and prompt_confirm(stdscr, f"Cancel job {jid}?"):
             state.status = client.cancel(jid)
             refresh_jobs(state, client)
-        elif jid:
+        elif state.jobs:
             state.status = "Cancel aborted"
 
 
 def self_test_keys() -> None:
     client = SelfTestClient()
-    state = AppState(user="alice", filter_user="alice")
-    refresh_jobs(state, client)  # type: ignore[arg-type]
+    state = AppState(filter_user="alice")
+    refresh_jobs(state, client)
     assert len(state.jobs) == 2
-    handle_key(None, state, client, "j")  # type: ignore[arg-type]
+    handle_key(None, state, client, "j")
     assert state.selected == 1
-    handle_key(None, state, client, "k")  # type: ignore[arg-type]
+    handle_key(None, state, client, "k")
     assert state.selected == 0
-    handle_key(None, state, client, "\n")  # type: ignore[arg-type]
+    handle_key(None, state, client, "\n")
     assert state.detail_title == "job 1"
     assert "requested: cpu=1,mem=1000M,node=1,billing=1" in state.detail_lines
     assert "allocated: cpu=40,node=1,billing=40" in state.detail_lines
     assert "stdout: /home/alice/slurm-1.out" in state.detail_lines
-    handle_key(None, state, client, "h")  # type: ignore[arg-type]
+    handle_key(None, state, client, "h")
     assert state.detail_title == "history 1"
     assert "state: COMPLETED" in state.detail_lines
     assert "requested: cpu=1,mem=1000M,node=1,billing=1" in state.detail_lines
-    handle_key(None, state, client, "r")  # type: ignore[arg-type]
+    handle_key(None, state, client, "r")
     assert client.refreshes == 2
-    handle_key(None, state, client, "q")  # type: ignore[arg-type]
+    handle_key(None, state, client, "q")
     assert not state.running
 
 
@@ -815,8 +840,7 @@ def main(stdscr: curses.window) -> int:
     stdscr.keypad(True)
     stdscr.timeout(250)
     client = MaxwellClient()
-    user = load_user()
-    state = AppState(user=user, filter_user=user)
+    state = AppState(filter_user=load_user())
     refresh_jobs(state, client)
     while state.running:
         if time.time() >= state.next_refresh:
