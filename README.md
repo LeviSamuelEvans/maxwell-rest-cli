@@ -53,7 +53,7 @@ Request GPUs with `--gres`. The value follows Slurm's `gpu:N` or `gpu:<type>:N` 
 
 ```sh
 ./bin/maxwell submit examples/maxwell-gpu-test-job.sh \
-  --name gpu-smoke --partition maxgpu --gres gpu:1 \
+  --name gpu-test --partition maxgpu --gres gpu:1 \
   --time 600 --cpus 2 --mem 4000
 ```
 
