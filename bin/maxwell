@@ -172,7 +172,8 @@ curl_api() {
   local slurm_token url body_file http_status rc body errors
   slurm_token="$(ensure_slurm_token)"
   url="$(api_base)$endpoint"
-  body_file="$(mktemp "${TMPDIR:-/tmp}/maxwell-resp.XXXXXX.json")" || die "could not create temp file"
+  # BSD/macOS mktemp only replaces trailing Xs, so keep the suffix off the template.
+  body_file="$(mktemp "${TMPDIR:-/tmp}/maxwell-resp.XXXXXX")" || die "could not create temp file"
 
   local -a args
   args=(-sSL -X "$method" -o "$body_file" -w '%{http_code}')
